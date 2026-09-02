@@ -1,0 +1,102 @@
+# Legitimate analytics queries. Every case here MUST be accepted.
+#
+# This file is the reason the reject count means anything. A validator that
+# returns ok=False unconditionally scores 100% on unsafe.yaml. The number worth
+# quoting is the pair: N unsafe rejected AND M safe accepted.
+#
+# expect_limit_injected records whether the guardrail should have rewritten the
+# statement, so a change to the LIMIT logic fails loudly instead of silently
+# widening or narrowing the cap.
+
+- id: simple_select
+  sql: "SELECT id, name FROM customers"
+  expect_limit_injected: true
+
+- id: simple_agg_no_limit
+  sql: "SELECT customer_id, SUM(quantity) FROM order_items GROUP BY customer_id"
+  expect_limit_injected: true
+
+- id: join_with_small_limit
+  sql: "SELECT c.name, o.status FROM customers c JOIN orders o ON o.customer_id = c.id LIMIT 50"
+  expect_limit_injected: false
+
+- id: limit_at_cap
+  sql: "SELECT id FROM orders LIMIT 1000"
+  expect_limit_injected: false
+
+- id: limit_over_cap
+  sql: "SELECT id FROM orders LIMIT 999999"
+  expect_limit_injected: true
+
+- id: fetch_first_normalised
+  sql: "SELECT id FROM orders FETCH FIRST 5 ROWS ONLY"
+  expect_limit_injected: true
+
+- id: cte_readonly
+  sql: |
+    WITH monthly AS (
+        SELECT date_trunc('month', placed_at) AS m, COUNT(*) AS n
+        FROM orders GROUP BY 1
+    )
+    SELECT * FROM monthly ORDER BY m DESC
+  expect_limit_injected: true
+
+- id: multi_cte_readonly
+  sql: |
+    WITH rev AS (
+        SELECT o.id, SUM(oi.quantity * oi.unit_price) AS total
+        FROM orders o JOIN order_items oi ON oi.order_id = o.id
+        GROUP BY o.id
+    ), ranked AS (
+        SELECT id, total, RANK() OVER (ORDER BY total DESC) AS rk FROM rev
+    )
+    SELECT * FROM ranked WHERE rk <= 10
+  expect_limit_injected: true
+
+- id: union_all
+  sql: "SELECT id FROM orders WHERE status = 'shipped' UNION ALL SELECT id FROM orders WHERE status = 'pending'"
+  expect_limit_injected: true
+
+- id: subquery_in_where
+  sql: "SELECT name FROM customers WHERE id IN (SELECT customer_id FROM orders WHERE status = 'refunded')"
+  expect_limit_injected: true
+
+- id: window_function
+  sql: "SELECT id, placed_at, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY placed_at) AS rn FROM orders"
+  expect_limit_injected: true
+
+- id: left_join_with_coalesce
+  sql: "SELECT c.name, COALESCE(COUNT(o.id), 0) AS orders FROM customers c LEFT JOIN orders o ON o.customer_id = c.id GROUP BY c.name"
+  expect_limit_injected: true
+
+- id: case_expression
+  sql: "SELECT CASE WHEN unit_cost > 20 THEN 'high' ELSE 'low' END AS band, COUNT(*) FROM products GROUP BY 1"
+  expect_limit_injected: true
+
+- id: having_clause
+  sql: "SELECT customer_id, COUNT(*) AS n FROM orders GROUP BY customer_id HAVING COUNT(*) > 5"
+  expect_limit_injected: true
+
+- id: date_filter
+  sql: "SELECT COUNT(*) FROM orders WHERE placed_at >= now() - INTERVAL '30 days'"
+  expect_limit_injected: true
+
+- id: string_containing_keyword
+  sql: "SELECT id FROM products WHERE name = 'DROP TABLE customers'"
+  expect_limit_injected: true
+
+- id: comment_containing_keyword
+  sql: "SELECT id FROM orders -- we do not DELETE FROM here"
+  expect_limit_injected: true
+
+- id: order_by_multiple
+  sql: "SELECT id, placed_at FROM orders ORDER BY placed_at DESC, id ASC LIMIT 25"
+  expect_limit_injected: false
+
+- id: distinct_on
+  sql: "SELECT DISTINCT ON (customer_id) customer_id, placed_at FROM orders ORDER BY customer_id, placed_at DESC"
+  expect_limit_injected: true
+
+- id: aggregate_only
+  sql: "SELECT SUM(quantity * unit_price) AS revenue FROM order_items"
+  expect_limit_injected: true

