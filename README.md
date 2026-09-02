@@ -9,19 +9,16 @@ tested against an adversarial fixture set.
 
 ## The loop
 
-```
+![Agent graph flow](docs/flow-of-the-loop.png)
+
+<details>
+<summary>Text version of the diagram</summary>
+
+​```
 START ─→ plan ─→ generate ─→ validate ──ok──→ execute ──ok──→ END (succeeded)
-                    ▲           │                  │
-                    │      rejected             db_error
-                    │           ▼                  │
-                    └───────── repair ◀────────────┘
-                    │           │
-                    │     out of retries
-                    │           ▼
-                    │      END (failed)
-                    │
-        schema errors route repair ─→ plan instead of ─→ generate
-```
+...
+​```
+</details>
 
 Five real nodes, not one prompt. Each is a pure `state -> partial state`
 function in [agent/nodes.py](agent/nodes.py); the wiring is in
